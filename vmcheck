@@ -1,0 +1,137 @@
+#!/usr/bin/env python
+from pyVim import connect
+from pyVim.connect import SmartConnect
+from pyVim.task import WaitForTask
+from pyVmomi import vmodl, vim
+import ssl
+import sys
+import argparse
+from tabulate import tabulate
+
+# Create a context for the SSL connection. Used when connecting to VMware
+ssl_context = ssl.create_default_context()
+ssl_context.check_hostname = False
+ssl_context.verify_mode = ssl.CERT_NONE
+
+# Connect to VMware Vcenter
+try:
+    service_instance = SmartConnect(host='ADD vcenter URL',
+                                    user='ADD your account/service account',
+                                    pwd='ADD your password',
+                                    sslContext=ssl_context)
+except vmodl.MethodFault as error:
+    print("Failed to connect to the vCenter server:")
+    print(error)
+    sys.exit(1)
+
+# Create a dictiothe clusters. These point to a path in vCenter where our clusters are located
+clusters = {
+    'cluster1': '/<path in vcenter for cluster1>',
+    'cluster2': '/<path in vcenter for cluster2>',
+    'cluster3': '/<path in vcenter for cluster3>',
+    'cluster4': '/<path in vcenter for cluster4>',
+    'cluster5': '/<path in vcenter for cluster5>'
+}
+
+# A bit of a hacky way of making the description (help message) show all the valid clusters that are in the dictionary on new lines.
+# First we create a list of all the cluster names with 2 spaces before (for formatting reasons), then we use argparse.RawTextHelpFormatter to not mess
+# with our formatting.
+cluster_list = ['  {}'.format(cluster) for cluster in clusters.keys()]
+description = '''Script to retrieve and display information about VMs for the OpenShift clusters.
+
+Available clusters:
+''' + '\n'.join(cluster_list)
+
+# Create an argument parser with the description and the RawTextHelpFormatter
+parser = argparse.ArgumentParser(description=description, formatter_class=argparse.RawTextHelpFormatter, usage='%(prog)s cluster or %(prog)s -o wide cluster')
+parser.add_argument('cluster', help='the cluster to retrieve VMs from')
+parser.add_argument('-o', help='the layout of the table (default or wide)', choices=['default', 'wide'])
+args = parser.parse_args()
+
+# Check if the cluster is a valid cluster = exists in the mapping dictionary
+if args.cluster not in clusters:
+    parser.print_help()
+    sys.exit(1)
+
+# Get directory path in vCenter for the cluster
+try:
+    directory = clusters[args.cluster]
+except KeyError:
+    print("Error: non-available cluster specified")
+    sys.exit(1)
+
+# Get a reference and create a search index. We use this to find hte VM's
+inventory = service_instance.content.rootFolder
+search_index = service_instance.content.searchIndex
+# Find them and then sort them by name
+try:
+    vm_list = search_index.FindByInventoryPath(inventoryPath=directory)
+except vmodl.MethodFault as error:
+    print("Failed to retrieve the VMs from the specified directory:")
+    print(error)
+    sys.exit(1)
+sorted_vm_list = sorted(vm_list.childEntity, key=lambda vm: vm.name)
+
+# Create list for the table, also start the usage variables.
+table = []
+total_cpu_usage = 0
+total_memory_usage = 0
+
+# Loop over the VM's in our directory to extract the information we want
+for vm in sorted_vm_list:
+
+    # Witht this, we make sure that we only get VM's and that the code wont fail if it sees a subdir.
+    if not hasattr(vm, 'summary'):
+        continue
+    # Get the VM's name
+    vm_name = vm.name
+    # Get the resource usage
+    resource_usage = vm.summary.quickStats
+    cpu_usage_ghz = resource_usage.overallCpuUsage / 1000.0
+    memory_usage_gb = resource_usage.guestMemoryUsage / 1024.0
+    # Format to 2 decimals
+    cpu_usage_ghz = format(cpu_usage_ghz, '.2f')
+    memory_usage_gb = format(memory_usage_gb, '.2f')
+    # Change into float (to be able to add to total)
+    cpu_usage_ghz = float(cpu_usage_ghz)
+    memory_usage_gb = float(memory_usage_gb)
+    # Add the CPU usage and memory usage to the totals
+    total_cpu_usage += cpu_usage_ghz
+    total_memory_usage += memory_usage_gb
+    
+    # Get the VM's power state and make it more readable
+    power_state = vm.runtime.powerState
+    if power_state == "poweredOn":
+        power_state = "On"
+    elif power_state == "poweredOff":
+        power_state = "Off"
+
+    # Get the IP address - assign N/A if not found
+    ip_address = vm.guest.ipAddress
+    if not ip_address:
+        ip_address = "N/A"
+    
+    # Get the VM's hardware version
+    hardware_version = vm.config.version
+
+    # Add a row to the table with the VM's name, resource usage, IP address, hardware version, and power state
+    if args.o == "wide":
+        table.append([vm_name, cpu_usage_ghz, memory_usage_gb, ip_address, hardware_version, power_state])
+    # Same as above but skip IP and HW version
+    else:
+        table.append([vm_name, cpu_usage_ghz, memory_usage_gb, power_state])
+    
+# Get the total # of VM's
+num_vms = len(sorted_vm_list)
+# Print the result depending on if wide our normal output was requested
+if args.o == "wide":
+    print(tabulate(table, headers=['VM Name', 'CPU Usage (GHz)', 'Memory Usage (GB)', 'IP Address', 'Hardware Version', 'Power State']))
+else:
+    print(tabulate(table, headers=['VM Name', 'CPU Usage (GHz)', 'Memory Usage (GB)', 'Power State']))
+# Print the total CPU, memory usage and number of VM's in the directory. Format to 2 decimals
+print("-" * 79)
+print(f'Total CPU usage: {format(total_cpu_usage, ".2f")} GHz')
+print(f'Total memory usage: {format(total_memory_usage, ".2f")} GB')
+print(f'Number of VMs: {num_vms}')
+
+connect.Disconnect(service_instance)
